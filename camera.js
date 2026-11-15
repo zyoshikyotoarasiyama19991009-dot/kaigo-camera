@@ -14,7 +14,8 @@ const HOLD_CLEAR_MS = 800;   // ぼかさない顔を見失ってから、選択
 const HOLD_EDGE_MS = 3500;   // 画面の端で見失った顔（半分はみ出した顔は検出しにくい）は、長めにぼかしを残す
 const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対して）。ふちをやわらかくする分、広めにとる
 const EXPAND_H = 2.2;
-const BLUR_CELLS = 9;        // 小さいほど強いぼかし
+const BLUR_STEPS = [2, 3, 4]; // にじませる幅（顔の範囲を72に縮めた画面での幅）。大きいほど強いぼかし
+const BLUR_HAZE = 0.12;       // 白っぽさ（0〜1）
 
 // 顔の見分け（距離が小さいほど似ている。テストでは同じ人 0.33〜0.52、別人 0.69以上）
 const ID_MATCH = 0.47;       // これ未満が2回続いたら「選んだ人」とみなしてぼかしを外す
@@ -288,7 +289,8 @@ export class BlurCamera {
         best.w += (b.w - best.w) * a; best.h += (b.h - best.h) * a;
         best.seen = now;
         best.kp = b.kp; best.kpAt = now;
-      } else {
+      } else if (!this.tracks.some((t) => t.seen === now && coverage(t, b) > 0.3)) {
+        // いま見えている顔と大きく重なる検出は、同じ顔の二重検出なので新しい顔として扱わない
         this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false });
       }
     }
@@ -323,27 +325,36 @@ export class BlurCamera {
       if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
       return h;
     };
-    // 1) 段階的に縮小（一気に縮めると映像がちらつくため）
-    const ph = size(this.pre, BLUR_CELLS * 4);
+    // 1) 顔の範囲を小さな画面に写す（段階的に縮小。一気に縮めると映像がちらつくため）
+    const MW = 72;
+    const ph = size(this.pre, MW * 2);
     this.pctx.imageSmoothingEnabled = true;
     this.pctx.drawImage(this.raw, r.x, r.y, r.w, r.h, 0, 0, this.pre.width, ph);
-    const sh = size(this.small, BLUR_CELLS);
-    this.sctx.imageSmoothingEnabled = true;
-    this.sctx.drawImage(this.pre, 0, 0, this.pre.width, ph, 0, 0, BLUR_CELLS, sh);
-    // 2) 中くらいの大きさに戻す
-    const MW = 72;
     const mh = size(this.midA, MW); size(this.midB, MW);
     const a = this.actx, b = this.bctx;
     a.imageSmoothingEnabled = true;
-    a.drawImage(this.small, 0, 0, BLUR_CELLS, sh, 0, 0, MW, mh);
-    // 3) ずらし重ねで、ます目の跡をならす
+    a.globalAlpha = 1;
+    a.drawImage(this.pre, 0, 0, this.pre.width, ph, 0, 0, MW, mh);
+    // 2) にじませる：少しずつずらした絵を重ねて平均する。幅を変えて3回くり返すと、
+    //    ます目の跡が残らない、こすったようなぼかしになる
     b.globalCompositeOperation = 'source-over';
-    b.globalAlpha = 1;
-    b.drawImage(this.midA, 0, 0);
-    const d = Math.round(MW / BLUR_CELLS * 0.55);
-    const offs = [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, d], [d, -d], [-d, -d]];
-    offs.forEach(([ox, oy], i) => { b.globalAlpha = 1 / (i + 2); b.drawImage(this.midA, ox, oy); });
-    b.globalAlpha = 1;
+    const smear = (dst, src, d) => {
+      dst.globalAlpha = 1;
+      dst.drawImage(src, 0, 0);
+      let n = 2;
+      for (let oy = -d; oy <= d; oy += d) for (let ox = -d; ox <= d; ox += d) {
+        if (!ox && !oy) continue;
+        dst.globalAlpha = 1 / n++;
+        dst.drawImage(src, ox, oy);
+      }
+      dst.globalAlpha = 1;
+    };
+    smear(b, this.midA, BLUR_STEPS[0]);
+    smear(a, this.midB, BLUR_STEPS[1]);
+    smear(b, this.midA, BLUR_STEPS[2]);
+    // 3) うっすら白くして、曇りガラスのように明るくする
+    b.fillStyle = `rgba(255,255,255,${BLUR_HAZE})`;
+    b.fillRect(0, 0, MW, mh);
     // 4) ふちをやわらかく（だ円の外側ほど透明に）
     b.globalCompositeOperation = 'destination-in';
     b.setTransform(MW / 2, 0, 0, mh / 2, MW / 2, mh / 2);
@@ -459,6 +470,14 @@ function nearest(person, desc) {
   let min = Infinity;
   for (const s of person.samples) { const d = distance(s, desc); if (d < min) min = d; }
   return min;
+}
+
+// 2つの枠の重なりが、小さいほうの枠に占める割合
+function coverage(t, b) {
+  const x0 = Math.max(t.x, b.x), y0 = Math.max(t.y, b.y);
+  const x1 = Math.min(t.x + t.w, b.x + b.w), y1 = Math.min(t.y + t.h, b.y + b.h);
+  const inter = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  return inter / (Math.min(t.w * t.h, b.w * b.h) || 1);
 }
 
 function overlapScore(t, b) {
