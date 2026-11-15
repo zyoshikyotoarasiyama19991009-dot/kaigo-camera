@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>介護指導カメラ</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="介護指導カメラ">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#12343b">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 画面1：内容を選ぶ -->
+<main id="screenTitle" class="screen">
+  <header class="top">
+    <h1>介護指導カメラ</h1>
+    <p class="lead">顔に自動でぼかしを入れて撮影します。ぼかし前の映像は保存されません。</p>
+  </header>
+  <section class="block">
+    <h2>何を撮りますか？</h2>
+    <div id="titleList" class="chips"></div>
+    <form id="addForm" class="addRow">
+      <input id="addInput" type="text" maxlength="20" placeholder="項目を追加（例：口腔ケア）" autocomplete="off">
+      <button type="submit" class="btn sub">追加</button>
+    </form>
+    <p class="note">追加した項目は長押しで削除できます。</p>
+  </section>
+  <section class="block">
+    <label class="switchRow">
+      <span>
+        <strong>音声も録音する</strong>
+        <small>会話に名前が入るときは切にしてください</small>
+      </span>
+      <input id="audioToggle" type="checkbox" checked>
+    </label>
+  </section>
+  <div class="bottomBar">
+    <button id="startCamera" class="btn primary" disabled>内容を選んでください</button>
+  </div>
+</main>
+
+<!-- 画面2：カメラ -->
+<main id="screenCamera" class="screen dark" hidden>
+  <div id="stage">
+    <canvas id="out"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="hint">ぼかしをかけたくない人の顔をタップしてください</div>
+    <div id="status" hidden></div>
+    <div id="recBadge" hidden><span class="dot"></span><span id="recTime">0:00</span></div>
+  </div>
+  <div class="camBar">
+    <button id="backBtn" class="btn ghost">もどる</button>
+    <button id="recBtn" class="recBtn" aria-label="録画開始" disabled><span></span></button>
+    <button id="flipBtn" class="btn ghost">切替</button>
+  </div>
+  <video id="cam" playsinline muted autoplay></video>
+</main>
+
+<!-- 画面3：確認 -->
+<main id="screenReview" class="screen" hidden>
+  <header class="top">
+    <h1 id="reviewName">確認</h1>
+    <p class="lead">最後まで再生して、<strong>ぼかしたい顔が見えていないか</strong>確認してください。</p>
+  </header>
+  <video id="review" controls playsinline></video>
+  <p id="reviewInfo" class="note"></p>
+  <div class="bottomBar two">
+    <button id="discardBtn" class="btn danger">撮り直す（破棄）</button>
+    <button id="saveBtn" class="btn primary">保存する</button>
+  </div>
+  <p id="saveMsg" class="note center"></p>
+  <button id="againBtn" class="btn sub wide" hidden>別の内容を撮る</button>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
