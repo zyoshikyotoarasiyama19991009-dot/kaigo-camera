@@ -16,11 +16,15 @@ const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対し
 const EXPAND_H = 2.2;
 // 顔かどうかの調べ直し（ライトや家具を顔とまちがえた枠を消すため）
 const HOLD_UNSURE_MS = 400;  // まだ顔と確かめられていない枠を見失ったとき、ぼかしを残す時間
-const VERIFY_OK = 0.65;      // 拡大して調べ直した点数がこれ以上なら「顔」（テストでは本物の顔 0.82以上、顔でないもの 0.59以下）
-const VERIFY_FAILS = 3;      // これだけ続けて顔と確かめられなければ「顔ではない」として、ぼかしを消す
-const VERIFY_EVERY_MS = 150; // 調べ直しの間隔
-const VERIFY_FAKE_MS = 700;  // 「顔ではない」とした枠を、念のため調べ直す間隔
+// 判断は1回の点数ではなく、くり返し調べた平均で行う（ライトは 0.51〜0.68 を行き来し、本物の顔は 0.75〜0.94 で安定）
+const VERIFY_OK = 0.72;      // 平均がこれ以上なら「顔」
+const VERIFY_NG = 0.67;      // 3回以上調べて平均がこれ未満なら「顔ではない」として、ぼかしを消す
+const VERIFY_STRONG = 0.8;   // 平均が一度でもこれ以上になった枠は、その後どう見えても「顔ではない」にはしない（横を向いた顔を守る）
+const VERIFY_MIN_SAMPLES = 3;
+const VERIFY_EVERY_MS = 150; // 判断がつくまでの調べ直しの間隔
+const VERIFY_KEEP_MS = 500;  // 判断がついたあとも調べ続ける間隔
 const STRONG_SCORE = 0.75;   // 「顔ではない」とした枠でも、検出の点数がこれ以上になったらすぐぼかしに戻す
+const FAKE_ZONE_MS = 8000;   // 「顔ではない」と分かった場所を覚えておく時間。同じ場所に出た枠は、ぼかす前に調べる
 const BLUR_STEPS = [2, 3, 4]; // にじませる幅（顔の範囲を72に縮めた画面での幅）。大きいほど強いぼかし
 const BLUR_HAZE = 0.12;       // 白っぽさ（0〜1）
 
@@ -58,6 +62,7 @@ export class BlurCamera {
     this.nextPerson = 1;
     this.idBusy = false;
     this.idCanvas = document.createElement('canvas');
+    this.fakeZones = [];
     this.vCanvas = document.createElement('canvas');
     this.vCanvas.width = 256; this.vCanvas.height = 256;
     this.vctx2 = this.vCanvas.getContext('2d', { alpha: false });
@@ -211,8 +216,10 @@ export class BlurCamera {
   _verify(now) {
     let pick = null;
     for (const t of this.tracks) {
-      if (t.clear || t.verified || t.seen !== now || now < t.nextV) continue;
-      if (!pick || (pick.fake && !t.fake) || (pick.fake === t.fake && t.nextV < pick.nextV)) pick = t;
+      if (t.clear || t.seen !== now || now < t.nextV) continue;
+      // まだ判断がついていない枠を先に、次に「顔ではない」とした枠、最後に「顔」と分かっている枠
+      const rank = (x) => (x.fake ? 1 : x.verified ? 2 : 0);
+      if (!pick || rank(t) < rank(pick) || (rank(t) === rank(pick) && t.nextV < pick.nextV)) pick = t;
     }
     if (!pick) return;
     const S = 256, g = this.vctx2;
@@ -235,17 +242,33 @@ export class BlurCamera {
       if (Math.hypot(dx, dy) > S * 0.2 || b.width < S * 0.2) continue;
       score = Math.max(score, d.categories?.[0]?.score ?? 0);
     }
-    if (score >= VERIFY_OK) {
-      pick.verified = true; pick.fake = false; pick.vFails = 0;
-    } else if (pick.fake) {
-      pick.nextV = now + VERIFY_FAKE_MS;
-    } else if (++pick.vFails >= VERIFY_FAILS) {
-      pick.fake = true;
-      pick.fakeBox = { cx, cy, w: pick.w };
-      pick.nextV = now + VERIFY_FAKE_MS;
+    // 点数の平均を更新
+    // 「顔ではない」としていた枠で、はっきり顔の点数が出たら、平均を待たずにすぐ顔として扱う（人が入ってきたとき）
+    if (pick.fake && score >= VERIFY_STRONG) pick.vN = 0;
+    pick.vAvg = pick.vN ? pick.vAvg * 0.6 + score * 0.4 : score;
+    pick.vN++;
+    if (pick.vAvg >= VERIFY_STRONG) pick.strong = true;
+    if (pick.strong || pick.vAvg >= VERIFY_OK) {
+      pick.verified = true; pick.fake = false;
+    } else if (pick.vN >= VERIFY_MIN_SAMPLES && pick.vAvg < VERIFY_NG) {
+      pick.verified = false; pick.fake = true;
+      this._rememberFake(pick, now);
     } else {
-      pick.nextV = now + VERIFY_EVERY_MS;
+      pick.verified = false;   // まだ判断がつかない間は、ぼかしたまま
     }
+    pick.nextV = now + (pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
+  }
+
+  // 「顔ではない」と分かった場所を覚える
+  _rememberFake(t, now) {
+    const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
+    this.fakeZones = this.fakeZones.filter((z) => now - z.at < FAKE_ZONE_MS && Math.hypot(z.cx - cx, z.cy - cy) > z.w * 0.5);
+    this.fakeZones.push({ cx, cy, w: t.w, at: now });
+  }
+
+  _inFakeZone(b, now) {
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    return this.fakeZones.some((z) => now - z.at < FAKE_ZONE_MS && Math.hypot(z.cx - cx, z.cy - cy) < Math.max(z.w, b.w) * 0.8);
   }
 
   // ---- 顔の見分け ----
@@ -344,15 +367,16 @@ export class BlurCamera {
         best.seen = now;
         best.kp = b.kp; best.kpAt = now;
         if (best.fake) {
-          // 「顔ではない」とした枠でも、はっきり顔らしい検出が来たり、位置や大きさが変わったりしたら、
-          // 人が入ってきた可能性があるので、すぐぼかしに戻して調べ直す
+          // はっきり顔らしい検出が来たら、すぐぼかしに戻す。
+          // 位置や大きさが変わっただけなら、ぼかしは付けずに、すぐ調べ直す（カメラが動いただけのことが多い）
           const fb = best.fakeBox;
           const moved = !fb || Math.hypot(b.x + b.w / 2 - fb.cx, b.y + b.h / 2 - fb.cy) > fb.w * 0.3 || Math.abs(b.w - fb.w) > fb.w * 0.3;
-          if (b.s >= STRONG_SCORE || moved) { best.fake = false; best.vFails = 0; best.nextV = 0; }
+          if (b.s >= STRONG_SCORE) { best.fake = false; best.vN = 0; best.vAvg = 0; best.nextV = 0; }
+          else if (moved) { best.nextV = 0; best.fakeBox = { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w }; this._rememberFake(best, now); }
         }
       } else if (!this.tracks.some((t) => !t.fake && t.seen === now && coverage(t, b) > 0.3)) {
         // いま見えている顔と大きく重なる検出は、同じ顔の二重検出なので新しい顔として扱わない
-        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: false, vFails: 0, nextV: 0, fakeBox: null });
+        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: b.s < STRONG_SCORE && this._inFakeZone(b, now), vAvg: 0, vN: 0, strong: false, nextV: 0, fakeBox: { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w } });
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
