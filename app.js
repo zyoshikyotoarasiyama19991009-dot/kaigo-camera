@@ -9,6 +9,7 @@ const KEY = 'kaigoCamera.customTitles';
 const screens = { title: $('screenTitle'), camera: $('screenCamera'), review: $('screenReview') };
 function show(name) {
   for (const [k, el] of Object.entries(screens)) el.hidden = k !== name;
+  document.documentElement.classList.toggle('camOn', name === 'camera');
   window.scrollTo(0, 0);
 }
 
@@ -65,6 +66,8 @@ $('addForm').addEventListener('submit', (e) => {
 const camera = new BlurCamera({ video: $('cam'), out: $('out'), overlay: $('overlay') });
 const recorder = new CanvasRecorder($('out'));
 window.__kaigoCamera = camera; // 動作確認用
+// 一度タップしたら案内文を消す（「ぼかしなし」の表示と重ならないように）
+camera.onToggle = () => { $('hint').hidden = true; };
 let wakeLock = null;
 let timerId = null;
 let result = null; // { blob, url, fileName }

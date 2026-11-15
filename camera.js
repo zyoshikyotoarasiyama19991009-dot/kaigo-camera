@@ -10,9 +10,10 @@ import { FilesetResolver, FaceDetector } from './vendor/tasks-vision/vision_bund
 
 const HOLD_BLUR_MS = 1200;   // ぼかす顔を見失ってから、ぼかしを残す時間
 const HOLD_CLEAR_MS = 800;   // ぼかさない顔を見失ってから、選択を覚えておく時間（過ぎると選択解除＝ぼかしに戻る）
-const EXPAND_W = 1.7;        // ぼかし範囲の広げ方（顔の幅に対して）
-const EXPAND_H = 2.0;
-const BLUR_CELLS = 7;        // 小さいほど強いぼかし
+const HOLD_EDGE_MS = 3500;   // 画面の端で見失った顔（半分はみ出した顔は検出しにくい）は、長めにぼかしを残す
+const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対して）。ふちをやわらかくする分、広めにとる
+const EXPAND_H = 2.2;
+const BLUR_CELLS = 9;        // 小さいほど強いぼかし
 
 export class BlurCamera {
   constructor({ video, out, overlay, onStatus }) {
@@ -27,6 +28,13 @@ export class BlurCamera {
     this.tctx = this.tile.getContext('2d', { alpha: false });
     this.small = document.createElement('canvas');
     this.sctx = this.small.getContext('2d', { alpha: false });
+    this.pre = document.createElement('canvas');
+    this.pctx = this.pre.getContext('2d', { alpha: false });
+    this.midA = document.createElement('canvas');
+    this.actx = this.midA.getContext('2d', { alpha: false });
+    this.midB = document.createElement('canvas');
+    this.bctx = this.midB.getContext('2d');
+    this.onToggle = null;
     this.onStatus = onStatus || (() => {});
 
     this.detector = null;
@@ -207,7 +215,13 @@ export class BlurCamera {
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
-    this.tracks = this.tracks.filter((t) => now - t.seen < (t.clear ? HOLD_CLEAR_MS : HOLD_BLUR_MS));
+    const W = this.out.width, H = this.out.height;
+    this.tracks = this.tracks.filter((t) => {
+      if (t.clear) return now - t.seen < HOLD_CLEAR_MS;
+      const m = t.w * 0.25;
+      const atEdge = t.x < m || t.y < m || t.x + t.w > W - m || t.y + t.h > H - m;
+      return now - t.seen < (atEdge ? HOLD_EDGE_MS : HOLD_BLUR_MS);
+    });
   }
 
   _region(t, W, H) {
@@ -219,21 +233,60 @@ export class BlurCamera {
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   }
 
+  // すりガラスのような、なめらかなぼかし。
+  // 手順：顔の範囲を段階的に小さくして細部を消す → 少し大きくして、ずらし重ねでならす
+  //       → ふちをやわらかく消す → 元の大きさに戻して重ねる
   _blurFace(t, W, H) {
     const r = this._region(t, W, H);
     if (r.w < 2 || r.h < 2) return;
-    const sw = BLUR_CELLS, sh = Math.max(2, Math.round(BLUR_CELLS * r.h / r.w));
-    if (this.small.width !== sw || this.small.height !== sh) { this.small.width = sw; this.small.height = sh; }
+    const ratio = r.h / r.w;
+    const size = (c, w) => {
+      const h = Math.max(2, Math.round(w * ratio));
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      return h;
+    };
+    // 1) 段階的に縮小（一気に縮めると映像がちらつくため）
+    const ph = size(this.pre, BLUR_CELLS * 4);
+    this.pctx.imageSmoothingEnabled = true;
+    this.pctx.drawImage(this.raw, r.x, r.y, r.w, r.h, 0, 0, this.pre.width, ph);
+    const sh = size(this.small, BLUR_CELLS);
     this.sctx.imageSmoothingEnabled = true;
-    this.sctx.drawImage(this.raw, r.x, r.y, r.w, r.h, 0, 0, sw, sh);
+    this.sctx.drawImage(this.pre, 0, 0, this.pre.width, ph, 0, 0, BLUR_CELLS, sh);
+    // 2) 中くらいの大きさに戻す
+    const MW = 72;
+    const mh = size(this.midA, MW); size(this.midB, MW);
+    const a = this.actx, b = this.bctx;
+    a.imageSmoothingEnabled = true;
+    a.drawImage(this.small, 0, 0, BLUR_CELLS, sh, 0, 0, MW, mh);
+    // 3) ずらし重ねで、ます目の跡をならす
+    b.globalCompositeOperation = 'source-over';
+    b.globalAlpha = 1;
+    b.drawImage(this.midA, 0, 0);
+    const d = Math.round(MW / BLUR_CELLS * 0.55);
+    const offs = [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, d], [d, -d], [-d, -d]];
+    offs.forEach(([ox, oy], i) => { b.globalAlpha = 1 / (i + 2); b.drawImage(this.midA, ox, oy); });
+    b.globalAlpha = 1;
+    // 4) ふちをやわらかく（だ円の外側ほど透明に）
+    b.globalCompositeOperation = 'destination-in';
+    b.setTransform(MW / 2, 0, 0, mh / 2, MW / 2, mh / 2);
+    b.fillStyle = this._mask(b);
+    b.fillRect(-1, -1, 2, 2);
+    b.setTransform(1, 0, 0, 1, 0, 0);
+    b.globalCompositeOperation = 'source-over';
+    // 5) 録画される画面へ
     const o = this.octx;
-    o.save();
-    o.beginPath();
-    o.ellipse(r.x + r.w / 2, r.y + r.h / 2, r.w / 2, r.h / 2, 0, 0, Math.PI * 2);
-    o.clip();
     o.imageSmoothingEnabled = true;
-    o.drawImage(this.small, 0, 0, sw, sh, r.x, r.y, r.w, r.h);
-    o.restore();
+    o.drawImage(this.midB, 0, 0, MW, mh, r.x, r.y, r.w, r.h);
+  }
+
+  _mask(ctx) {
+    if (!this._maskGrad) {
+      const g = ctx.createRadialGradient(0, 0, 0.78, 0, 0, 1);
+      g.addColorStop(0, 'rgba(0,0,0,1)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      this._maskGrad = g;
+    }
+    return this._maskGrad;
   }
 
   _blurAll(W, H) {
@@ -305,7 +358,10 @@ export class BlurCamera {
         hit = t; hitArea = r.w * r.h;
       }
     }
-    if (hit) hit.clear = !hit.clear;
+    if (hit) {
+      hit.clear = !hit.clear;
+      if (this.onToggle) this.onToggle(hit.clear);
+    }
   }
 }
 
