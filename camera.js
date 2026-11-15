@@ -14,6 +14,13 @@ const HOLD_CLEAR_MS = 800;   // ぼかさない顔を見失ってから、選択
 const HOLD_EDGE_MS = 3500;   // 画面の端で見失った顔（半分はみ出した顔は検出しにくい）は、長めにぼかしを残す
 const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対して）。ふちをやわらかくする分、広めにとる
 const EXPAND_H = 2.2;
+// 顔かどうかの調べ直し（ライトや家具を顔とまちがえた枠を消すため）
+const HOLD_UNSURE_MS = 400;  // まだ顔と確かめられていない枠を見失ったとき、ぼかしを残す時間
+const VERIFY_OK = 0.65;      // 拡大して調べ直した点数がこれ以上なら「顔」（テストでは本物の顔 0.82以上、顔でないもの 0.59以下）
+const VERIFY_FAILS = 3;      // これだけ続けて顔と確かめられなければ「顔ではない」として、ぼかしを消す
+const VERIFY_EVERY_MS = 150; // 調べ直しの間隔
+const VERIFY_FAKE_MS = 700;  // 「顔ではない」とした枠を、念のため調べ直す間隔
+const STRONG_SCORE = 0.75;   // 「顔ではない」とした枠でも、検出の点数がこれ以上になったらすぐぼかしに戻す
 const BLUR_STEPS = [2, 3, 4]; // にじませる幅（顔の範囲を72に縮めた画面での幅）。大きいほど強いぼかし
 const BLUR_HAZE = 0.12;       // 白っぽさ（0〜1）
 
@@ -51,6 +58,9 @@ export class BlurCamera {
     this.nextPerson = 1;
     this.idBusy = false;
     this.idCanvas = document.createElement('canvas');
+    this.vCanvas = document.createElement('canvas');
+    this.vCanvas.width = 256; this.vCanvas.height = 256;
+    this.vctx2 = this.vCanvas.getContext('2d', { alpha: false });
     this.onStatus = onStatus || (() => {});
 
     this.detector = null;
@@ -171,6 +181,7 @@ export class BlurCamera {
     if (this.detector) {
       try {
         this._updateTracks(this._detect(W, H, now), now);
+        this._verify(now);
         detected = true;
         this._identify(now);
       } catch (e) {
@@ -185,13 +196,56 @@ export class BlurCamera {
     } else {
       this.octx.drawImage(this.raw, 0, 0);
       for (const t of this.tracks) {
-        if (!t.clear) this._blurFace(t, W, H);
+        if (!t.clear && !t.fake) this._blurFace(t, W, H);
       }
     }
     this._drawLabel(W, H);
 
     // 4) 目印（録画されない）
     this._drawOverlay(W, H);
+  }
+
+  // ---- 顔かどうかの調べ直し ----
+  // 疑わしい枠は、その部分だけを拡大してもう一度検出にかける。本物の顔は拡大すると高い点数で
+  // 検出され直すが、ライトや家具はほとんど検出されない。1コマに1つだけ調べる。
+  _verify(now) {
+    let pick = null;
+    for (const t of this.tracks) {
+      if (t.clear || t.verified || t.seen !== now || now < t.nextV) continue;
+      if (!pick || (pick.fake && !t.fake) || (pick.fake === t.fake && t.nextV < pick.nextV)) pick = t;
+    }
+    if (!pick) return;
+    const S = 256, g = this.vctx2;
+    const side = Math.max(pick.w, pick.h) * 2.4;
+    const cx = pick.x + pick.w / 2, cy = pick.y + pick.h / 2;
+    g.fillStyle = '#777';
+    g.fillRect(0, 0, S, S);
+    // 画面の外にはみ出す部分は灰色のままにする
+    const sx = Math.max(0, cx - side / 2), sy = Math.max(0, cy - side / 2);
+    const ex = Math.min(this.raw.width, cx + side / 2), ey = Math.min(this.raw.height, cy + side / 2);
+    if (ex - sx < 2 || ey - sy < 2) return;
+    const k = S / side;
+    g.drawImage(this.raw, sx, sy, ex - sx, ey - sy, (sx - (cx - side / 2)) * k, (sy - (cy - side / 2)) * k, (ex - sx) * k, (ey - sy) * k);
+    let score = 0;
+    for (const d of this.detector.detectForVideo(this.vCanvas, this._ts(now)).detections) {
+      const b = d.boundingBox;
+      if (!b) continue;
+      // 切り出しの中央にある検出だけを数える（となりの人の顔を拾わないため）
+      const dx = b.originX + b.width / 2 - S / 2, dy = b.originY + b.height / 2 - S / 2;
+      if (Math.hypot(dx, dy) > S * 0.2 || b.width < S * 0.2) continue;
+      score = Math.max(score, d.categories?.[0]?.score ?? 0);
+    }
+    if (score >= VERIFY_OK) {
+      pick.verified = true; pick.fake = false; pick.vFails = 0;
+    } else if (pick.fake) {
+      pick.nextV = now + VERIFY_FAKE_MS;
+    } else if (++pick.vFails >= VERIFY_FAILS) {
+      pick.fake = true;
+      pick.fakeBox = { cx, cy, w: pick.w };
+      pick.nextV = now + VERIFY_FAKE_MS;
+    } else {
+      pick.nextV = now + VERIFY_EVERY_MS;
+    }
   }
 
   // ---- 顔の見分け ----
@@ -201,7 +255,7 @@ export class BlurCamera {
     const havePersons = this.persons.some((p) => p.samples.length > 0);
     let pick = null;
     for (const t of this.tracks) {
-      if (now - t.kpAt > 120 || now < t.nextId) continue;   // いま見えている顔だけ
+      if (t.fake || now - t.kpAt > 120 || now < t.nextId) continue;   // いま見えている顔だけ
       if (t.clear ? !t.person : (!havePersons || t.noAuto)) continue;
       // ぼかし中の顔（戻ってきた人かもしれない）を優先
       if (!pick || (pick.clear && !t.clear) || (pick.clear === t.clear && t.nextId < pick.nextId)) pick = t;
@@ -259,7 +313,7 @@ export class BlurCamera {
     const full = this.detector.detectForVideo(this.raw, this._ts(now));
     for (const d of full.detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height, kp: (d.keypoints || []).map((k) => ({ x: k.x * W, y: k.y * H })) });
+      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => ({ x: k.x * W, y: k.y * H })) });
     }
     // 遠くの小さい顔を拾うため、画面の一部を拡大して順番に調べる
     const tw = Math.round(W * 0.6), th = Math.round(H * 0.6);
@@ -271,7 +325,7 @@ export class BlurCamera {
     const part = this.detector.detectForVideo(this.tile, this._ts(now));
     for (const d of part.detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX + tx, y: b.originY + ty, w: b.width, h: b.height, kp: (d.keypoints || []).map((k) => ({ x: k.x * tw + tx, y: k.y * th + ty })) });
+      if (b) boxes.push({ x: b.originX + tx, y: b.originY + ty, w: b.width, h: b.height, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => ({ x: k.x * tw + tx, y: k.y * th + ty })) });
     }
     return boxes;
   }
@@ -289,9 +343,16 @@ export class BlurCamera {
         best.w += (b.w - best.w) * a; best.h += (b.h - best.h) * a;
         best.seen = now;
         best.kp = b.kp; best.kpAt = now;
-      } else if (!this.tracks.some((t) => t.seen === now && coverage(t, b) > 0.3)) {
+        if (best.fake) {
+          // 「顔ではない」とした枠でも、はっきり顔らしい検出が来たり、位置や大きさが変わったりしたら、
+          // 人が入ってきた可能性があるので、すぐぼかしに戻して調べ直す
+          const fb = best.fakeBox;
+          const moved = !fb || Math.hypot(b.x + b.w / 2 - fb.cx, b.y + b.h / 2 - fb.cy) > fb.w * 0.3 || Math.abs(b.w - fb.w) > fb.w * 0.3;
+          if (b.s >= STRONG_SCORE || moved) { best.fake = false; best.vFails = 0; best.nextV = 0; }
+        }
+      } else if (!this.tracks.some((t) => !t.fake && t.seen === now && coverage(t, b) > 0.3)) {
         // いま見えている顔と大きく重なる検出は、同じ顔の二重検出なので新しい顔として扱わない
-        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false });
+        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: false, vFails: 0, nextV: 0, fakeBox: null });
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
@@ -300,6 +361,7 @@ export class BlurCamera {
       if (t.clear) return now - t.seen < HOLD_CLEAR_MS;
       const m = t.w * 0.25;
       const atEdge = t.x < m || t.y < m || t.x + t.w > W - m || t.y + t.h > H - m;
+      if (!t.verified) return now - t.seen < HOLD_UNSURE_MS;
       return now - t.seen < (atEdge ? HOLD_EDGE_MS : HOLD_BLUR_MS);
     });
   }
@@ -408,6 +470,7 @@ export class BlurCamera {
     c.clearRect(0, 0, W, H);
     const lw = Math.max(3, Math.round(Math.min(W, H) * 0.006));
     for (const t of this.tracks) {
+      if (t.fake) continue;
       const r = this._region(t, W, H);
       c.lineWidth = lw;
       if (t.clear) {
@@ -442,6 +505,7 @@ export class BlurCamera {
     const py = (e.clientY - rect.top - offY) / s;
     let hit = null, hitArea = Infinity;
     for (const t of this.tracks) {
+      if (t.fake) continue;
       const r = this._region(t, W, H);
       if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h && r.w * r.h < hitArea) {
         hit = t; hitArea = r.w * r.h;
@@ -451,6 +515,7 @@ export class BlurCamera {
       hit.clear = !hit.clear;
       hit.hits = 0; hit.misses = 0; hit.nextId = 0;
       if (hit.clear) {
+        hit.verified = true;
         // この人の顔を覚える（次の照合のタイミングで特徴をとる）
         hit.noAuto = false;
         hit.person = { id: this.nextPerson++, samples: [] };
