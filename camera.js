@@ -7,6 +7,7 @@
 //  - 顔を見失っても、しばらくは直前の位置をぼかし続ける
 
 import { FilesetResolver, FaceDetector } from './vendor/tasks-vision/vision_bundle.mjs';
+import { loadFaceId, faceIdReady, cropAligned, describe, distance } from './face-id.js';
 
 const HOLD_BLUR_MS = 1200;   // ぼかす顔を見失ってから、ぼかしを残す時間
 const HOLD_CLEAR_MS = 800;   // ぼかさない顔を見失ってから、選択を覚えておく時間（過ぎると選択解除＝ぼかしに戻る）
@@ -14,6 +15,16 @@ const HOLD_EDGE_MS = 3500;   // 画面の端で見失った顔（半分はみ出
 const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対して）。ふちをやわらかくする分、広めにとる
 const EXPAND_H = 2.2;
 const BLUR_CELLS = 9;        // 小さいほど強いぼかし
+
+// 顔の見分け（距離が小さいほど似ている。テストでは同じ人 0.33〜0.52、別人 0.69以上）
+const ID_MATCH = 0.47;       // これ未満が2回続いたら「選んだ人」とみなしてぼかしを外す
+const ID_MATCH_TIMES = 2;
+const ID_MISMATCH = 0.68;    // ぼかしなしの顔が、これ以上の距離を3回続けたら別人とみなしてぼかしに戻す
+const ID_MISMATCH_TIMES = 3;
+const ID_LEARN_MIN = 0.25;   // 覚えている顔とこの範囲で違うとき、新しい角度として追加で覚える
+const ID_MAX_SAMPLES = 15;
+const ID_CHECK_BLUR_MS = 300;   // ぼかし中の顔を照合する間隔
+const ID_CHECK_CLEAR_MS = 600;  // ぼかしなしの顔を確かめる間隔
 
 export class BlurCamera {
   constructor({ video, out, overlay, onStatus }) {
@@ -35,6 +46,10 @@ export class BlurCamera {
     this.midB = document.createElement('canvas');
     this.bctx = this.midB.getContext('2d');
     this.onToggle = null;
+    this.persons = [];        // ぼかさないと選んだ人の顔の特徴（メモリの中だけ。カメラを閉じると消える）
+    this.nextPerson = 1;
+    this.idBusy = false;
+    this.idCanvas = document.createElement('canvas');
     this.onStatus = onStatus || (() => {});
 
     this.detector = null;
@@ -81,6 +96,12 @@ export class BlurCamera {
       this.detectorFailed = true;
       throw e;
     }
+    // 顔を見分ける部品も準備中に読み込む（読み込み中は映像が一瞬止まるため、撮影前に済ませる）。
+    // 失敗しても、20秒かかっても、撮影はできる（その場合は位置の追跡だけになる）
+    await Promise.race([
+      loadFaceId().catch(() => {}),
+      new Promise((r) => setTimeout(r, 20000)),
+    ]);
   }
 
   async _openCamera() {
@@ -110,6 +131,7 @@ export class BlurCamera {
     this.running = false;
     this._closeCamera();
     this.tracks = [];
+    this.persons = [];
   }
 
   lock(v) { this.locked = v; }
@@ -149,6 +171,7 @@ export class BlurCamera {
       try {
         this._updateTracks(this._detect(W, H, now), now);
         detected = true;
+        this._identify(now);
       } catch (e) {
         detected = false;
       }
@@ -170,6 +193,60 @@ export class BlurCamera {
     this._drawOverlay(W, H);
   }
 
+  // ---- 顔の見分け ----
+  // 1回に1つの顔だけ、映像の合間に調べる（映像の動きを止めないため）
+  _identify(now) {
+    if (this.idBusy || !faceIdReady()) return;
+    const havePersons = this.persons.some((p) => p.samples.length > 0);
+    let pick = null;
+    for (const t of this.tracks) {
+      if (now - t.kpAt > 120 || now < t.nextId) continue;   // いま見えている顔だけ
+      if (t.clear ? !t.person : (!havePersons || t.noAuto)) continue;
+      // ぼかし中の顔（戻ってきた人かもしれない）を優先
+      if (!pick || (pick.clear && !t.clear) || (pick.clear === t.clear && t.nextId < pick.nextId)) pick = t;
+    }
+    if (!pick) return;
+    pick.nextId = now + (pick.clear ? ID_CHECK_CLEAR_MS : ID_CHECK_BLUR_MS);
+    if (!cropAligned(this.raw, pick.kp, this.idCanvas)) return;   // 横顔・小さい顔は判断しない
+    const wasClear = pick.clear, person = pick.person;
+    this.idBusy = true;
+    describe(this.idCanvas).then((desc) => {
+      if (!this.tracks.includes(pick) || pick.clear !== wasClear || pick.person !== person) return;
+      if (pick.clear) this._checkClear(pick, desc); else this._checkBlurred(pick, desc);
+    }).catch(() => {}).finally(() => { this.idBusy = false; });
+  }
+
+  // ぼかしなしの顔：角度ちがいを追加で覚える。別人に入れ替わっていたら、ぼかしに戻す
+  _checkClear(t, desc) {
+    const p = t.person;
+    if (!this.persons.includes(p)) return;
+    if (p.samples.length === 0) { p.samples.push(desc); return; }
+    const d = nearest(p, desc);
+    if (d >= ID_MISMATCH) {
+      if (++t.misses >= ID_MISMATCH_TIMES) { t.clear = false; t.person = null; t.misses = 0; t.hits = 0; }
+      return;
+    }
+    t.misses = 0;
+    if (d > ID_LEARN_MIN && d < ID_MATCH && p.samples.length < ID_MAX_SAMPLES) p.samples.push(desc);
+  }
+
+  // ぼかし中の顔：選んだ人と確信できるときだけ、ぼかしを外す
+  _checkBlurred(t, desc) {
+    let best = null, bestD = Infinity;
+    for (const p of this.persons) {
+      if (!p.samples.length) continue;
+      if (this.tracks.some((o) => o !== t && o.clear && o.person === p)) continue;   // その人はすでに映っている
+      const d = nearest(p, desc);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    if (best && bestD < ID_MATCH) {
+      if (t.candidate !== best) { t.candidate = best; t.hits = 0; }
+      if (++t.hits >= ID_MATCH_TIMES) { t.clear = true; t.person = best; t.hits = 0; t.misses = 0; t.candidate = null; }
+    } else {
+      t.hits = 0; t.candidate = null;
+    }
+  }
+
   _ts(now) {
     const ts = Math.max(now, this.lastTs + 1);
     this.lastTs = ts;
@@ -181,7 +258,7 @@ export class BlurCamera {
     const full = this.detector.detectForVideo(this.raw, this._ts(now));
     for (const d of full.detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height });
+      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height, kp: (d.keypoints || []).map((k) => ({ x: k.x * W, y: k.y * H })) });
     }
     // 遠くの小さい顔を拾うため、画面の一部を拡大して順番に調べる
     const tw = Math.round(W * 0.6), th = Math.round(H * 0.6);
@@ -193,7 +270,7 @@ export class BlurCamera {
     const part = this.detector.detectForVideo(this.tile, this._ts(now));
     for (const d of part.detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX + tx, y: b.originY + ty, w: b.width, h: b.height });
+      if (b) boxes.push({ x: b.originX + tx, y: b.originY + ty, w: b.width, h: b.height, kp: (d.keypoints || []).map((k) => ({ x: k.x * tw + tx, y: k.y * th + ty })) });
     }
     return boxes;
   }
@@ -210,8 +287,9 @@ export class BlurCamera {
         best.x += (b.x - best.x) * a; best.y += (b.y - best.y) * a;
         best.w += (b.w - best.w) * a; best.h += (b.h - best.h) * a;
         best.seen = now;
+        best.kp = b.kp; best.kpAt = now;
       } else {
-        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false });
+        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false });
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
@@ -360,9 +438,27 @@ export class BlurCamera {
     }
     if (hit) {
       hit.clear = !hit.clear;
+      hit.hits = 0; hit.misses = 0; hit.nextId = 0;
+      if (hit.clear) {
+        // この人の顔を覚える（次の照合のタイミングで特徴をとる）
+        hit.noAuto = false;
+        hit.person = { id: this.nextPerson++, samples: [] };
+        this.persons.push(hit.person);
+      } else {
+        // ぼかしに戻した人は、覚えた特徴を消す。この顔は自動では外さない
+        if (hit.person) this.persons = this.persons.filter((p) => p !== hit.person);
+        hit.person = null;
+        hit.noAuto = true;
+      }
       if (this.onToggle) this.onToggle(hit.clear);
     }
   }
+}
+
+function nearest(person, desc) {
+  let min = Infinity;
+  for (const s of person.samples) { const d = distance(s, desc); if (d < min) min = d; }
+  return min;
 }
 
 function overlapScore(t, b) {
