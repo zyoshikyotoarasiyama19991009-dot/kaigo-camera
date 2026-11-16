@@ -21,6 +21,8 @@ const VERIFY_OK = 0.72;      // 平均がこれ以上なら「顔」
 const VERIFY_NG = 0.67;      // 3回以上調べて平均がこれ未満なら「顔ではない」として、ぼかしを消す
 const VERIFY_STRONG = 0.8;   // 平均が一度でもこれ以上になった枠は、その後どう見えても「顔ではない」にはしない（横を向いた顔を守る）
 const VERIFY_MIN_SAMPLES = 3;
+const BIRTH_OK = 0.5;         // 新しい枠をその場で調べた点数がこれ未満なら、最初からぼかさない
+const BIRTH_RETRIES = 5;      // ぼかさなかった枠を、短い間隔で調べ直す回数
 // 回転させた向き（横倒し・逆さ）では基準を上げる。実測：寝ている顔は 0.75〜0.89（中央0.82）、
 // ライトは回転させると 0.72 を超えることがあるが 0.8 には届かない
 const VERIFY_OK_TURNED = 0.76;
@@ -63,6 +65,7 @@ export class BlurCamera {
     this.midB = document.createElement('canvas');
     this.bctx = this.midB.getContext('2d');
     this.onToggle = null;
+    this.onBirth = null;      // 動作確認用
     this.persons = [];        // ぼかさないと選んだ人の顔の特徴（メモリの中だけ。カメラを閉じると消える）
     this.nextPerson = 1;
     this.idBusy = false;
@@ -240,6 +243,11 @@ export class BlurCamera {
       // 別の向きは、はっきり顔と分かる点数のときだけ採用する（ライトなどが通りにくいように）
       if (s2 >= VERIFY_STRONG && s2 > score) { score = s2; usedRot = alt; pick.rot = alt; pick.view = null; pick.rotAt = now; pick.s = s2; }
     }
+    // 最初にぼかさなかった枠で、顔らしい点数が出たら、ぼかしを入れて通常の調べ直しに移る
+    if (pick.probation > 0) {
+      pick.probation--;
+      if (score >= BIRTH_OK) { pick.fake = false; pick.probation = 0; pick.vN = 0; pick.unsureN = 0; }
+    }
     // 点数の平均を更新
     pick.vAvg = pick.vN ? pick.vAvg * 0.6 + score * 0.4 : score;
     pick.vN++;
@@ -261,7 +269,7 @@ export class BlurCamera {
     }
     // 「顔ではない」としていた枠で高い点数が出たら、人が入ってきたかもしれないので、すぐ次も調べる
     const hurry = pick.fake && score >= VERIFY_OK;
-    pick.nextV = now + (hurry ? 0 : pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
+    pick.nextV = now + (hurry ? 0 : pick.probation > 0 ? VERIFY_EVERY_MS : pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
   }
 
   // 枠の部分を、指定した向きに回して拡大し、もう一度検出にかけた点数を返す
@@ -521,7 +529,23 @@ export class BlurCamera {
         }
       } else if (!this.tracks.some((t) => !t.fake && t.seen === now && coverage(t, b) > 0.3)) {
         // いま見えている顔と大きく重なる検出は、同じ顔の二重検出なので新しい顔として扱わない
-        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, vx: 0, vy: 0, upAt: now, rcx: b.x + b.w / 2, rcy: b.y + b.h / 2, fullAt: b.full ? now : 0, rot: b.rot || 0, view: b.view || null, altIdx: 0, s: b.s, rotAt: now, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: b.s < STRONG_SCORE && this._inFakeZone(b, now), vAvg: 0, vN: 0, strong: false, nextV: 0, fakeBox: { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w } });
+        const nt = { id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, vx: 0, vy: 0, upAt: now, rcx: b.x + b.w / 2, rcy: b.y + b.h / 2, fullAt: b.full ? now : 0, rot: b.rot || 0, view: b.view || null, altIdx: 0, s: b.s, rotAt: now, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: b.s < STRONG_SCORE && this._inFakeZone(b, now), vAvg: 0, vN: 0, strong: false, nextV: 0, fakeBox: { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w } };
+        // はっきり顔と分かる検出（点数が高い）は、最初のコマからぼかす。
+        // 怪しい検出は、ぼかす前にその場で拡大して調べ、顔らしさがまったく無ければ最初からぼかさない
+        // （人がいない場面で、物にぼかしが一瞬出るのを防ぐ）。ぼかさなかった枠も、しばらくは短い間隔で調べ続ける
+        if (!nt.fake && b.s < STRONG_SCORE) {
+          let s0 = this._cropScore(nt, nt.rot, now);
+          if (s0 < BIRTH_OK && this.searchTurned) {
+            for (const r of [0, 90, 270, 180]) {
+              if (r === nt.rot) continue;
+              s0 = Math.max(s0, this._cropScore(nt, r, now));
+              if (s0 >= BIRTH_OK) break;
+            }
+          }
+          if (s0 < BIRTH_OK) { nt.fake = true; nt.probation = BIRTH_RETRIES; nt.nextV = now + VERIFY_EVERY_MS; }
+          if (this.onBirth) this.onBirth({ s: b.s, s0, rot: nt.rot, cx: Math.round(b.x + b.w / 2), cy: Math.round(b.y + b.h / 2), w: Math.round(b.w) });
+        }
+        this.tracks.push(nt);
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
