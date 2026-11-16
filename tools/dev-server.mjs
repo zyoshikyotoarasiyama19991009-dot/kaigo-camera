@@ -14,7 +14,7 @@ const types = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8', '.wasm': 'application/wasm',
-  '.png': 'image/png', '.tflite': 'application/octet-stream',
+  '.png': 'image/png', '.mp4': 'video/mp4', '.mov': 'video/mp4', '.tflite': 'application/octet-stream',
 };
 
 function handler(req, res) {
@@ -24,7 +24,7 @@ function handler(req, res) {
   if (!file.startsWith(root) || file.startsWith(path.join(root, 'tools'))) { res.writeHead(403).end(); return; }
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404).end('not found'); return; }
-    res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-store' });
     res.end(data);
   });
 }

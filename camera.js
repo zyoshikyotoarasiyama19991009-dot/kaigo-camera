@@ -15,12 +15,17 @@ const HOLD_EDGE_MS = 3500;   // 画面の端で見失った顔（半分はみ出
 const EXPAND_W = 1.9;        // ぼかし範囲の広げ方（顔の幅に対して）。ふちをやわらかくする分、広めにとる
 const EXPAND_H = 2.2;
 // 顔かどうかの調べ直し（ライトや家具を顔とまちがえた枠を消すため）
-const HOLD_UNSURE_MS = 400;  // まだ顔と確かめられていない枠を見失ったとき、ぼかしを残す時間
+const HOLD_UNSURE_MS = 550;  // まだ顔と確かめられていない枠を見失ったとき、ぼかしを残す時間
 // 判断は1回の点数ではなく、くり返し調べた平均で行う（ライトは 0.51〜0.68 を行き来し、本物の顔は 0.75〜0.94 で安定）
 const VERIFY_OK = 0.72;      // 平均がこれ以上なら「顔」
 const VERIFY_NG = 0.67;      // 3回以上調べて平均がこれ未満なら「顔ではない」として、ぼかしを消す
 const VERIFY_STRONG = 0.8;   // 平均が一度でもこれ以上になった枠は、その後どう見えても「顔ではない」にはしない（横を向いた顔を守る）
 const VERIFY_MIN_SAMPLES = 3;
+// 回転させた向き（横倒し・逆さ）では基準を上げる。実測：寝ている顔は 0.75〜0.89（中央0.82）、
+// ライトは回転させると 0.72 を超えることがあるが 0.8 には届かない
+const VERIFY_OK_TURNED = 0.76;
+const VERIFY_NG_TURNED = 0.72;
+const VERIFY_UNSURE_MAX = 6;  // 判断がつかない状態がこの回数続いたら「顔ではない」とする（中間の点数をうろうろするライト対策）
 const VERIFY_EVERY_MS = 150; // 判断がつくまでの調べ直しの間隔
 const VERIFY_KEEP_MS = 500;  // 判断がついたあとも調べ続ける間隔
 const STRONG_SCORE = 0.75;   // 「顔ではない」とした枠でも、検出の点数がこれ以上になったらすぐぼかしに戻す
@@ -78,6 +83,8 @@ export class BlurCamera {
     this.locked = false;      // 録画中は画面サイズを固定
     this.label = '';
     this.tileIndex = 0;
+    this.slotIndex = 0;
+    this.searchTurned = true;   // 寝ている人など、横倒し・逆さの顔も探すか
     this.lastTs = 0;
     this._loop = this._loop.bind(this);
 
@@ -222,17 +229,55 @@ export class BlurCamera {
       if (!pick || rank(t) < rank(pick) || (rank(t) === rank(pick) && t.nextV < pick.nextV)) pick = t;
     }
     if (!pick) return;
+    let usedRot = pick.rot || 0;
+    let score = this._cropScore(pick, usedRot, now);
+    if (score < VERIFY_OK && !pick.strong && this.searchTurned) {
+      // まっすぐで顔と確かめられないときは、別の向き（横倒し・逆さ）でも1つずつ試す
+      const alts = [0, 90, 270, 180].filter((r) => r !== (pick.rot || 0));
+      const alt = alts[pick.altIdx++ % alts.length];
+      const s2 = this._cropScore(pick, alt, now);
+      // 別の向きは、はっきり顔と分かる点数のときだけ採用する（ライトなどが通りにくいように）
+      if (s2 >= VERIFY_STRONG && s2 > score) { score = s2; usedRot = alt; pick.rot = alt; pick.view = null; pick.rotAt = now; pick.s = s2; }
+    }
+    // 点数の平均を更新
+    pick.vAvg = pick.vN ? pick.vAvg * 0.6 + score * 0.4 : score;
+    pick.vN++;
+    // 「ずっと顔として扱う」保護（横を向いたり、マスクで点数が下がったりしても、ぼかしを消さない）：
+    //  ・まっすぐな向きで高い点数が出たら、1回で適用する（ライトなどは、まっすぐでは高い点数にならない）
+    //  ・回転させた向きでは、高い点数が続いたときだけ適用する（ライトが回転でまぐれの高得点を出すことがあるため）
+    if (usedRot === 0 ? score >= VERIFY_STRONG : (pick.vN >= 4 && pick.vAvg >= VERIFY_STRONG)) pick.strong = true;
+    const turned = (pick.rot || 0) !== 0;
+    const okLine = turned ? VERIFY_OK_TURNED : VERIFY_OK, ngLine = turned ? VERIFY_NG_TURNED : VERIFY_NG;
+    if (pick.strong || pick.vAvg >= okLine) {
+      pick.verified = true; pick.fake = false; pick.unsureN = 0;
+    } else {
+      pick.verified = false;
+      pick.unsureN = (pick.unsureN || 0) + 1;
+      if ((pick.vN >= VERIFY_MIN_SAMPLES && pick.vAvg < ngLine) || pick.unsureN >= VERIFY_UNSURE_MAX) {
+        if (!pick.fake) { pick.fake = true; this._rememberFake(pick, now); }
+      }
+      // どちらでもない間は、ぼかしたまま（「顔ではない」としていた枠は、そのまま）
+    }
+    // 「顔ではない」としていた枠で高い点数が出たら、人が入ってきたかもしれないので、すぐ次も調べる
+    const hurry = pick.fake && score >= VERIFY_OK;
+    pick.nextV = now + (hurry ? 0 : pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
+  }
+
+  // 枠の部分を、指定した向きに回して拡大し、もう一度検出にかけた点数を返す
+  _cropScore(t, rot, now) {
     const S = 256, g = this.vctx2;
-    const side = Math.max(pick.w, pick.h) * 2.4;
-    const cx = pick.x + pick.w / 2, cy = pick.y + pick.h / 2;
-    g.fillStyle = '#777';
-    g.fillRect(0, 0, S, S);
-    // 画面の外にはみ出す部分は灰色のままにする
-    const sx = Math.max(0, cx - side / 2), sy = Math.max(0, cy - side / 2);
-    const ex = Math.min(this.raw.width, cx + side / 2), ey = Math.min(this.raw.height, cy + side / 2);
-    if (ex - sx < 2 || ey - sy < 2) return;
+    const side = Math.max(t.w, t.h) * 2.4;
+    const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
     const k = S / side;
-    g.drawImage(this.raw, sx, sy, ex - sx, ey - sy, (sx - (cx - side / 2)) * k, (sy - (cy - side / 2)) * k, (ex - sx) * k, (ey - sy) * k);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.fillStyle = '#777';
+    g.fillRect(0, 0, S, S);   // 画面の外にはみ出す部分は灰色のまま
+    g.translate(S / 2, S / 2);
+    g.rotate(rot * Math.PI / 180);
+    g.scale(k, k);
+    g.translate(-cx, -cy);
+    g.drawImage(this.raw, 0, 0);
+    g.setTransform(1, 0, 0, 1, 0, 0);
     let score = 0;
     for (const d of this.detector.detectForVideo(this.vCanvas, this._ts(now)).detections) {
       const b = d.boundingBox;
@@ -242,21 +287,7 @@ export class BlurCamera {
       if (Math.hypot(dx, dy) > S * 0.2 || b.width < S * 0.2) continue;
       score = Math.max(score, d.categories?.[0]?.score ?? 0);
     }
-    // 点数の平均を更新
-    // 「顔ではない」としていた枠で、はっきり顔の点数が出たら、平均を待たずにすぐ顔として扱う（人が入ってきたとき）
-    if (pick.fake && score >= VERIFY_STRONG) pick.vN = 0;
-    pick.vAvg = pick.vN ? pick.vAvg * 0.6 + score * 0.4 : score;
-    pick.vN++;
-    if (pick.vAvg >= VERIFY_STRONG) pick.strong = true;
-    if (pick.strong || pick.vAvg >= VERIFY_OK) {
-      pick.verified = true; pick.fake = false;
-    } else if (pick.vN >= VERIFY_MIN_SAMPLES && pick.vAvg < VERIFY_NG) {
-      pick.verified = false; pick.fake = true;
-      this._rememberFake(pick, now);
-    } else {
-      pick.verified = false;   // まだ判断がつかない間は、ぼかしたまま
-    }
-    pick.nextV = now + (pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
+    return score;
   }
 
   // 「顔ではない」と分かった場所を覚える
@@ -336,19 +367,61 @@ export class BlurCamera {
     const full = this.detector.detectForVideo(this.raw, this._ts(now));
     for (const d of full.detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => ({ x: k.x * W, y: k.y * H })) });
+      if (b) boxes.push({ x: b.originX, y: b.originY, w: b.width, h: b.height, rot: 0, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => ({ x: k.x * W, y: k.y * H })) });
     }
-    // 遠くの小さい顔を拾うため、画面の一部を拡大して順番に調べる
+    // 追加の検出を1コマに1つずつ順番に行う：
+    //  ・画面の一部を拡大（遠くの小さい顔を拾う）
+    //  ・映像を回転（寝ている人など、横倒し・逆さの顔を拾う。顔検出はまっすぐな顔しか得意でないため）
+    //  ・その両方（遠くで寝ている人の小さな顔を拾う）
     const tw = Math.round(W * 0.6), th = Math.round(H * 0.6);
     const pos = [[0, 0], [W - tw, 0], [0, H - th], [W - tw, H - th], [(W - tw) / 2, (H - th) / 2]];
-    const [tx, ty] = pos[this.tileIndex];
-    this.tileIndex = (this.tileIndex + 1) % pos.length;
-    if (this.tile.width !== tw || this.tile.height !== th) { this.tile.width = tw; this.tile.height = th; }
-    this.tctx.drawImage(this.raw, tx, ty, tw, th, 0, 0, tw, th);
-    const part = this.detector.detectForVideo(this.tile, this._ts(now));
-    for (const d of part.detections) {
+    if (!this.views || this.viewsFor !== W + 'x' + H) {
+      const tiles = pos.map(([tx, ty]) => ({ rot: 0, tx, ty, tw, th, q: 1 }));
+      const turned = [];
+      for (const rot of [90, 270]) {
+        turned.push({ rot, tx: 0, ty: 0, tw: W, th: H, q: 0.5 });
+        for (const [tx, ty] of pos) turned.push({ rot, tx, ty, tw, th, q: 1 });
+      }
+      turned.push({ rot: 180, tx: 0, ty: 0, tw: W, th: H, q: 0.5 });
+      this.views = { tiles, turned };
+      this.viewsFor = W + 'x' + H;
+      this.slotIndex = 0;
+    this.searchTurned = true;   // 寝ている人など、横倒し・逆さの顔も探すか
+    }
+    const { tiles, turned } = this.views;
+    // まっすぐの拡大と、回転とを1コマおきに。横倒しの顔を追っている間は、その顔を見つけた見方を優先する
+    this.slotIndex++;
+    const lying = this.tracks.find((t) => t.view && !t.fake && now - t.seen < 1500);
+    let view;
+    if (this.slotIndex % 2 === 0 || !this.searchTurned) view = tiles[(this.searchTurned ? this.slotIndex >> 1 : this.slotIndex) % tiles.length];
+    else if (lying && this.slotIndex % 4 === 1) view = lying.view;
+    else view = turned[(this.slotIndex >> 1) % turned.length];
+
+    const { rot, tx, ty, q } = view;
+    const vw = view.tw, vh = view.th;
+    const cw = Math.round((rot === 90 || rot === 270 ? vh : vw) * q), ch = Math.round((rot === 90 || rot === 270 ? vw : vh) * q);
+    if (this.tile.width !== cw || this.tile.height !== ch) { this.tile.width = cw; this.tile.height = ch; }
+    const g = this.tctx;
+    if (rot === 90) g.setTransform(0, q, -q, 0, vh * q, 0);          // 時計回りに90度
+    else if (rot === 270) g.setTransform(0, -q, q, 0, 0, vw * q);    // 反時計回りに90度
+    else if (rot === 180) g.setTransform(-q, 0, 0, -q, vw * q, vh * q);
+    else g.setTransform(q, 0, 0, q, 0, 0);
+    g.drawImage(this.raw, -tx, -ty);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    // 回転・拡大した画面での座標 (u,v) を、元の画面の座標に戻す
+    const back = (u, v) => {
+      let X, Y;
+      if (rot === 90) { X = v / q; Y = vh - u / q; }
+      else if (rot === 270) { X = vw - v / q; Y = u / q; }
+      else if (rot === 180) { X = vw - u / q; Y = vh - v / q; }
+      else { X = u / q; Y = v / q; }
+      return { x: X + tx, y: Y + ty };
+    };
+    for (const d of this.detector.detectForVideo(this.tile, this._ts(now)).detections) {
       const b = d.boundingBox;
-      if (b) boxes.push({ x: b.originX + tx, y: b.originY + ty, w: b.width, h: b.height, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => ({ x: k.x * tw + tx, y: k.y * th + ty })) });
+      if (!b) continue;
+      const p1 = back(b.originX, b.originY), p2 = back(b.originX + b.width, b.originY + b.height);
+      boxes.push({ x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y), w: Math.abs(p2.x - p1.x), h: Math.abs(p2.y - p1.y), rot, view: rot ? view : null, s: d.categories?.[0]?.score ?? 0, kp: (d.keypoints || []).map((k) => back(k.x * cw, k.y * ch)) });
     }
     return boxes;
   }
@@ -361,11 +434,19 @@ export class BlurCamera {
         if (s > bestScore) { bestScore = s; best = t; }
       }
       if (best && bestScore > 0.15) {
-        const a = 0.65;
-        best.x += (b.x - best.x) * a; best.y += (b.y - best.y) * a;
-        best.w += (b.w - best.w) * a; best.h += (b.h - best.h) * a;
+        // 同じ顔でも、向きのちがう見方（回転）がたまたま反応することがある。
+        // 今の向きと同じ検出か、今の向きよりはっきり点数が高い検出か、今の向きでしばらく見えていないときだけ採用する
+        const sameRot = (b.rot || 0) === (best.rot || 0);
+        const adopt = sameRot || b.s > best.s + 0.15 || now - best.rotAt > 700;
         best.seen = now;
-        best.kp = b.kp; best.kpAt = now;
+        if (adopt) {
+          const a = 0.65;
+          best.x += (b.x - best.x) * a; best.y += (b.y - best.y) * a;
+          best.w += (b.w - best.w) * a; best.h += (b.h - best.h) * a;
+          best.kp = b.kp; best.kpAt = now;
+          best.s = sameRot ? Math.max(b.s, best.s - 0.02) : b.s;   // 同じ向きの中では、最近の高い点数を覚えておく
+          best.rot = b.rot || 0; best.view = b.view || null; best.rotAt = now;
+        }
         if (best.fake) {
           // はっきり顔らしい検出が来たら、すぐぼかしに戻す。
           // 位置や大きさが変わっただけなら、ぼかしは付けずに、すぐ調べ直す（カメラが動いただけのことが多い）
@@ -376,7 +457,7 @@ export class BlurCamera {
         }
       } else if (!this.tracks.some((t) => !t.fake && t.seen === now && coverage(t, b) > 0.3)) {
         // いま見えている顔と大きく重なる検出は、同じ顔の二重検出なので新しい顔として扱わない
-        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: b.s < STRONG_SCORE && this._inFakeZone(b, now), vAvg: 0, vN: 0, strong: false, nextV: 0, fakeBox: { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w } });
+        this.tracks.push({ id: this.nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, clear: false, rot: b.rot || 0, view: b.view || null, altIdx: 0, s: b.s, rotAt: now, kp: b.kp, kpAt: now, person: null, nextId: 0, hits: 0, misses: 0, noAuto: false, verified: false, fake: b.s < STRONG_SCORE && this._inFakeZone(b, now), vAvg: 0, vN: 0, strong: false, nextV: 0, fakeBox: { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w } });
       }
     }
     // 見失った顔の整理。ぼかさない顔は、見失ったら選択を解除する（次に現れたらぼかす）
@@ -391,8 +472,9 @@ export class BlurCamera {
   }
 
   _region(t, W, H) {
-    const cx = t.x + t.w / 2, cy = t.y + t.h / 2 - t.h * 0.08;
-    const w = t.w * EXPAND_W, h = t.h * EXPAND_H;
+    const side = t.rot === 90 || t.rot === 270;   // 横倒しの顔
+    const cx = t.x + t.w / 2, cy = t.y + t.h / 2 - (t.rot ? 0 : t.h * 0.08);
+    const w = t.w * (side ? EXPAND_H : EXPAND_W), h = t.h * (side ? EXPAND_W : EXPAND_H);
     let x = cx - w / 2, y = cy - h / 2;
     const x0 = Math.max(0, Math.floor(x)), y0 = Math.max(0, Math.floor(y));
     const x1 = Math.min(W, Math.ceil(x + w)), y1 = Math.min(H, Math.ceil(y + h));

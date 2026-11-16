@@ -88,6 +88,7 @@ $('startCamera').addEventListener('click', async () => {
   $('recBtn').disabled = true;
   $('hint').hidden = false;
   camera.setLabel(labelText());
+  camera.searchTurned = $('lyingToggle').checked;
   setStatus('カメラと顔検出を準備しています…\n（準備ができるまで画面全体がぼけます）');
   try {
     await camera.start();
