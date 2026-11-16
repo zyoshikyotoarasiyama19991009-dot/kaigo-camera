@@ -217,5 +217,14 @@ $('saveBtn').addEventListener('click', async () => {
   }
 });
 
+// ---- 通信がなくても起動できるようにする ----
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).then(() => {
+    const n = $('offlineNote');
+    n.textContent = '準備完了：次からは、電波のない場所でも起動できます';
+    n.hidden = false;
+  }).catch(() => { /* 使えない端末では、今までどおり通信して開く */ });
+}
+
 renderTitles();
 show('title');
