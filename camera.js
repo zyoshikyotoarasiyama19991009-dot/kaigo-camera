@@ -21,6 +21,8 @@ const VERIFY_OK = 0.72;      // 平均がこれ以上なら「顔」
 const VERIFY_NG = 0.67;      // 3回以上調べて平均がこれ未満なら「顔ではない」として、ぼかしを消す
 const VERIFY_STRONG = 0.8;   // 平均が一度でもこれ以上になった枠は、その後どう見えても「顔ではない」にはしない（横を向いた顔を守る）
 const VERIFY_MIN_SAMPLES = 3;
+const GONE_SCORE = 0.3;        // 調べ直しの点数がこれ未満＝顔らしさがまったく無い
+const GONE_TIMES = 3;          // それがこの回数続いたら、「ずっと顔として扱う」保護も外して、ぼかしを消す（顔が去ったあとの背景に残るぼかし対策）
 const BIRTH_OK = 0.5;         // 新しい枠をその場で調べた点数がこれ未満なら、最初からぼかさない
 const BIRTH_RETRIES = 5;      // ぼかさなかった枠を、短い間隔で調べ直す回数
 // 回転させた向き（横倒し・逆さ）では基準を上げる。実測：寝ている顔は 0.75〜0.89（中央0.82）、
@@ -248,6 +250,12 @@ export class BlurCamera {
       pick.probation--;
       if (score >= BIRTH_OK) { pick.fake = false; pick.probation = 0; pick.vN = 0; pick.unsureN = 0; }
     }
+    // 顔らしさがまったく無い状態が続いたら、顔はもうそこに無いと判断する。
+    // （カメラをそらした直後、追跡が背景に取り残されて、ぼかしが残るのを防ぐ）
+    pick.lowN = score < GONE_SCORE ? (pick.lowN || 0) + 1 : 0;
+    if (pick.lowN >= GONE_TIMES && !pick.fake) {
+      pick.strong = false; pick.vAvg = score; pick.vN = VERIFY_MIN_SAMPLES;
+    }
     // 点数の平均を更新
     pick.vAvg = pick.vN ? pick.vAvg * 0.6 + score * 0.4 : score;
     pick.vN++;
@@ -269,7 +277,7 @@ export class BlurCamera {
     }
     // 「顔ではない」としていた枠で高い点数が出たら、人が入ってきたかもしれないので、すぐ次も調べる
     const hurry = pick.fake && score >= VERIFY_OK;
-    pick.nextV = now + (hurry ? 0 : pick.probation > 0 ? VERIFY_EVERY_MS : pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
+    pick.nextV = now + (hurry ? 0 : pick.probation > 0 || (pick.lowN > 0 && !pick.fake) ? VERIFY_EVERY_MS : pick.verified || pick.fake ? VERIFY_KEEP_MS : VERIFY_EVERY_MS);
   }
 
   // 枠の部分を、指定した向きに回して拡大し、もう一度検出にかけた点数を返す
